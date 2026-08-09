@@ -157,26 +157,43 @@ def _closure_relations(items, relations, ranks=None):
     return relations_out
 
 
-def _window_score(window, relations):
+def _pick_informative_group(items, relations, size):
     """
-    Score a window by how informative it is:
-    - prioritize unknown pair relations (needs user input)
-    - lightly reward already-known relations (better anchoring)
+    Greedily build a group of `size` items that maximizes still-unknown
+    pairs among them — a "densest subgraph in the unknown-relations graph"
+    heuristic. Unlike scanning only *contiguous* slices of `items`, this
+    can combine items from anywhere in the collection, which matters: a
+    sliding contiguous window can run out of new information to offer
+    (every window it can form may already be fully known) while distant
+    pairs are still genuinely unresolved, with no way to reach them. This
+    construction only fails to make progress when no unknown pair exists
+    anywhere — i.e. when the collection is already fully determined.
     """
-    total_pairs = len(window) * (len(window) - 1) // 2
-    if total_pairs == 0:
-        return -1, 0, 0
+    n = len(items)
 
-    known_pairs = 0
-    for i in range(len(window)):
-        for j in range(i + 1, len(window)):
-            if (window[i], window[j]) in relations:
-                known_pairs += 1
+    # Anchor on the item with the most unknown relations overall — the
+    # single best starting point for a productive group.
+    def unknown_degree(a):
+        return sum(1 for b in items if b != a and (a, b) not in relations)
 
-    unknown_pairs = total_pairs - known_pairs
-    # Unknown pairs drive progress; known pairs help with global anchoring.
-    score = unknown_pairs + (0.15 * known_pairs)
-    return score, unknown_pairs, known_pairs
+    start = max(items, key=unknown_degree)
+    chosen = [start]
+    chosen_set = {start}
+
+    while len(chosen) < size and len(chosen) < n:
+        best_item = None
+        best_new_unknown = -1
+        for cand in items:
+            if cand in chosen_set:
+                continue
+            new_unknown = sum(1 for c in chosen if (cand, c) not in relations)
+            if new_unknown > best_new_unknown:
+                best_new_unknown = new_unknown
+                best_item = cand
+        chosen.append(best_item)
+        chosen_set.add(best_item)
+
+    return chosen
 
 
 def _prepare(sorted_subsections, unsorted_dictionary) -> tuple[list, dict]:
@@ -223,33 +240,7 @@ def nextSubsectionToSort(sorted_subsections, unsorted_dictionary, subsection_siz
     if _all_pairs_known(items, relations):
         return []
 
-    best_idx = 0
-    best_score = None
-    best_unknown = -1
-    best_known = -1
-
-    for i in range(0, n - subsection_size + 1):
-        window = items[i:i + subsection_size]
-        score, unknown_pairs, known_pairs = _window_score(window, relations)
-
-        # Primary: highest score; secondary: most unknown pairs;
-        # tertiary: more known anchors; finally: earlier window.
-        if (
-            best_score is None
-            or score > best_score
-            or (score == best_score and unknown_pairs > best_unknown)
-            or (
-                score == best_score
-                and unknown_pairs == best_unknown
-                and known_pairs > best_known
-            )
-        ):
-            best_idx = i
-            best_score = score
-            best_unknown = unknown_pairs
-            best_known = known_pairs
-
-    return items[best_idx:best_idx + subsection_size]
+    return _pick_informative_group(items, relations, subsection_size)
 
 
 def _all_pairs_known(items, relations) -> bool:
