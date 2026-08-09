@@ -6,6 +6,7 @@ import html
 import json
 import os
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -27,7 +28,8 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
 DEFAULT_SCOPES = (
     "playlist-read-private playlist-read-collaborative "
-    "playlist-modify-public playlist-modify-private"
+    "playlist-modify-public playlist-modify-private "
+    "user-modify-playback-state user-read-playback-state"
 )
 DEFAULT_SUBSECTION_SIZE = 5
 
@@ -102,6 +104,13 @@ def has_write_scope() -> bool:
     token = STATE.get("token") or {}
     scope = token.get("scope", "") or ""
     return "playlist-modify-private" in scope or "playlist-modify-public" in scope
+
+
+def has_playback_scope() -> bool:
+    """Whether the current token was granted playback-control permissions."""
+    token = STATE.get("token") or {}
+    scope = token.get("scope", "") or ""
+    return "user-modify-playback-state" in scope
 
 
 def refresh_access_token() -> bool:
@@ -204,6 +213,98 @@ def spotify_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
                     raise SpotifyApiError(exc2.code, body_text) from exc2
         body_text = exc.read().decode("utf-8", errors="replace")
         raise SpotifyApiError(exc.code, body_text) from exc
+
+
+def spotify_put(path: str, body: dict[str, Any] | None = None) -> None:
+    """
+    PUT request to the Spotify API. Used for playback-control endpoints,
+    which reply 204 No Content on success rather than a JSON body, so
+    (unlike spotify_post) this doesn't try to parse a response.
+    """
+    access_token = get_access_token()
+    if not access_token:
+        raise SpotifyApiError(401, "Not connected to Spotify.")
+
+    url = f"{SPOTIFY_API_BASE_URL}{path}"
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+
+    def _attempt(token: str) -> None:
+        headers = auth_headers(token)
+        headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=payload, headers=headers, method="PUT")
+        with urllib.request.urlopen(request, timeout=20):
+            return
+
+    try:
+        _attempt(access_token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and refresh_access_token():
+            refreshed = get_access_token()
+            if refreshed:
+                try:
+                    _attempt(refreshed)
+                    return
+                except urllib.error.HTTPError as exc2:
+                    body_text = exc2.read().decode("utf-8", errors="replace")
+                    raise SpotifyApiError(exc2.code, body_text) from exc2
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise SpotifyApiError(exc.code, body_text) from exc
+
+
+def play_track_in_context(track_uri: str, context_uri: str | None) -> tuple[bool, str]:
+    """
+    Start playback of `track_uri` on the user's active Spotify Connect
+    device via the Web API (PUT /me/player/play), rather than a
+    `spotify:track:` deep link.
+
+    This is what lets it take over whatever's currently playing instead of
+    requiring the user to pause first — a deep link just asks the already-
+    running app to open a track, while this issues an explicit "start
+    playback" command the same way the official app's own UI would.
+
+    When `context_uri` (a playlist URI) is given, playback starts within
+    that playlist's context at `track_uri`, so shuffle/repeat and "up next"
+    behave the way they would if the user had pressed play from inside the
+    playlist themselves. Without one (e.g. playing from the rankings
+    gallery, which isn't tied to a playlist), it just queues the single
+    track.
+
+    Returns (ok, reason). On failure the caller should fall back to
+    opening `track_uri` as a plain Spotify URI, exactly as before.
+    """
+    if not has_playback_scope():
+        return False, "missing_scope"
+
+    if context_uri:
+        body: dict[str, Any] = {"context_uri": context_uri, "offset": {"uri": track_uri}}
+    else:
+        body = {"uris": [track_uri]}
+
+    def _attempt(device_id: str | None) -> tuple[bool, str]:
+        path = "/me/player/play"
+        if device_id:
+            path += f"?device_id={urllib.parse.quote(device_id)}"
+        try:
+            spotify_put(path, body)
+            return True, "ok"
+        except SpotifyApiError as exc:
+            return False, str(exc.status)
+
+    ok, reason = _attempt(None)
+    if ok:
+        return True, reason
+
+    if reason == "404":
+        # No currently-active device to target implicitly — look for any
+        # available Connect device and target it explicitly instead.
+        devices_payload = spotify_get("/me/player/devices") or {}
+        device_id = next(
+            (d.get("id") for d in devices_payload.get("devices", []) if d.get("id")), None
+        )
+        if device_id:
+            ok, reason = _attempt(device_id)
+
+    return ok, reason
 
 
 def fetch_all_playlists() -> list[dict[str, Any]]:
@@ -341,8 +442,9 @@ PAGE_STYLE = """
     .rank-card .titles { display: grid; gap: 2px; min-height: 52px; }
     .rank-card .title { font-weight: 700; font-size: .98rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
     .rank-card .artist { color: var(--muted); font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .rank-card .play-btn { align-self: flex-start; width: 38px; height: 38px; border-radius: 50%; background: var(--accent); color: #052010; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: .95rem; }
+    .rank-card .play-btn { align-self: flex-start; width: 38px; height: 38px; padding: 0; border-radius: 50%; background: var(--accent); color: #052010; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: .95rem; }
     .rank-card .play-btn:hover { background: #2fe378; }
+    .rank-card .play-btn.loading { opacity: .6; cursor: wait; }
     .rank-card .grip { position: absolute; top: 14px; right: 16px; color: var(--muted); font-size: .75rem; letter-spacing: .1em; text-transform: uppercase; }
     .finished-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; max-height: 62vh; overflow-y: auto; padding: 4px 4px 10px; }
     .finished-grid .rank-card { cursor: default; max-width: none; }
@@ -447,12 +549,17 @@ def render_homepage() -> str:
           </form>
         """
     else:
-        reconnect_hint = ""
+        missing_perms = []
         if STATE.get("token") and not has_write_scope():
-            reconnect_hint = """
+            missing_perms.append("importing a finished ranking as a new Spotify playlist")
+        if STATE.get("token") and not has_playback_scope():
+            missing_perms.append("playing songs directly from here")
+        reconnect_hint = ""
+        if missing_perms:
+            reconnect_hint = f"""
               <p class="muted" style="margin-top: 4px;">
-                Connected, but without permission to create playlists yet. Reconnect once to enable
-                importing a finished ranking as a new Spotify playlist.
+                Connected, but without permission for {safe(' and '.join(missing_perms))} yet.
+                Reconnect once to grant it.
               </p>
             """
         connect_section = f"""
@@ -588,7 +695,44 @@ DRAG_SCRIPT = """
 """
 
 
-def render_rank_card(position: int, track_id: str, meta: dict[str, Any], draggable: bool = True) -> str:
+PLAY_SCRIPT = """
+<script>
+function playTrack(btn) {
+  const trackUri = btn.dataset.trackUri;
+  const contextUri = btn.dataset.contextUri || '';
+  if (!trackUri) return;
+
+  function fallback() {
+    window.location.href = trackUri;
+  }
+
+  btn.classList.add('loading');
+  fetch('/play', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'track_uri=' + encodeURIComponent(trackUri) + '&context_uri=' + encodeURIComponent(contextUri),
+  })
+    .then((res) => res.json().catch(() => ({ ok: false })))
+    .then((data) => {
+      // Falls back to the plain spotify: URI (old behavior) whenever the
+      // Web API call couldn't do it directly — e.g. no active device, the
+      // connected account lacks the playback scope, or it's a free account.
+      if (!data || !data.ok) fallback();
+    })
+    .catch(fallback)
+    .finally(() => btn.classList.remove('loading'));
+}
+</script>
+"""
+
+
+def render_rank_card(
+    position: int,
+    track_id: str,
+    meta: dict[str, Any],
+    draggable: bool = True,
+    context_uri: str | None = None,
+) -> str:
     meta = meta or {}
     title = meta.get("title") or "(song no longer cached)"
     artist = meta.get("artist") or "Unknown artist"
@@ -602,14 +746,22 @@ def render_rank_card(position: int, track_id: str, meta: dict[str, Any], draggab
           <div class="title">{safe(title)}</div>
           <div class="artist">{safe(artist)}</div>
         </div>
-        <a class="play-btn" href="{safe(uri)}" title="Play in Spotify" onclick="event.stopPropagation()">▶</a>
+        <button
+          type="button"
+          class="play-btn"
+          title="Play in Spotify"
+          data-track-uri="{safe(uri)}"
+          data-context-uri="{safe(context_uri or '')}"
+          onclick="event.stopPropagation(); playTrack(this)"
+        >▶</button>
       </div>
     """
 
 
 def render_finished_page(selected: dict[str, Any], order: list[str], tracks: dict[str, dict], message: str, error: str) -> str:
+    context_uri = selected.get("uri")
     cards_html = "".join(
-        render_rank_card(i + 1, tid, tracks.get(tid, {}), draggable=False)
+        render_rank_card(i + 1, tid, tracks.get(tid, {}), draggable=False, context_uri=context_uri)
         for i, tid in enumerate(order)
     )
 
@@ -637,6 +789,7 @@ def render_finished_page(selected: dict[str, Any], order: list[str], tracks: dic
         </form>
       </div>
       {import_note}
+      {PLAY_SCRIPT}
     """
     return render_page(f"{selected.get('name')} — finished", "rank", body)
 
@@ -677,8 +830,9 @@ def render_rank_page() -> str:
     size = STATE.get("subsection_size", DEFAULT_SUBSECTION_SIZE)
     subsection = algo.nextSubsectionToSort(subsections, tracks, size)
 
+    context_uri = selected.get("uri")
     cards_html = "".join(
-        render_rank_card(i + 1, tid, tracks.get(tid, {}), draggable=True)
+        render_rank_card(i + 1, tid, tracks.get(tid, {}), draggable=True, context_uri=context_uri)
         for i, tid in enumerate(subsection)
     )
 
@@ -700,6 +854,7 @@ def render_rank_page() -> str:
         </div>
       </form>
       {DRAG_SCRIPT}
+      {PLAY_SCRIPT}
     """
     return render_page(f"Ranking {selected.get('name')}", "rank", body)
 
@@ -782,6 +937,7 @@ def render_subsection_edit_page(sub: dict[str, Any]) -> str:
         </div>
       </form>
       {DRAG_SCRIPT}
+      {PLAY_SCRIPT}
     """
     return render_page("Edit ranking", "subsections", body)
 
@@ -1108,6 +1264,16 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect("/subsections")
             return
 
+        if parsed.path == "/play":
+            track_uri = form.get("track_uri", "").strip()
+            context_uri = form.get("context_uri", "").strip() or None
+            if not track_uri:
+                self.send_json({"ok": False, "reason": "missing_track"}, status=400)
+                return
+            ok, reason = play_track_in_context(track_uri, context_uri)
+            self.send_json({"ok": ok, "reason": reason})
+            return
+
         if parsed.path == "/playlist/import":
             import_current_playlist_as_new()
             self.redirect("/rank")
@@ -1116,8 +1282,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_html("<h1>Not found</h1>", status=404)
 
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """
+    Same as ThreadingHTTPServer, except it doesn't print a full traceback
+    every time a client disconnects mid-request (closed tab, navigated
+    away, browser prefetch/cancel, etc.) — that's routine and not a bug,
+    just noisy under the default socketserver behavior. Anything else
+    still gets logged normally.
+    """
+
+    def handle_error(self, request, client_address) -> None:
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(
+            exc_type, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
+
 def main() -> None:
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = QuietThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Local Spotify picker running at http://{HOST}:{PORT}")
     try:
         webbrowser.open(f"http://{HOST}:{PORT}")
