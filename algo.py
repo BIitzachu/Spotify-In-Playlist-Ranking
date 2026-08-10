@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import Any
 
 
@@ -157,7 +158,7 @@ def _closure_relations(items, relations, ranks=None):
     return relations_out
 
 
-def _pick_informative_group(items, relations, size):
+def _pick_informative_group(items, relations, size, preselected=None):
     """
     Greedily build a group of `size` items that maximizes still-unknown
     pairs among them — a "densest subgraph in the unknown-relations graph"
@@ -168,17 +169,27 @@ def _pick_informative_group(items, relations, size):
     pairs are still genuinely unresolved, with no way to reach them. This
     construction only fails to make progress when no unknown pair exists
     anywhere — i.e. when the collection is already fully determined.
+
+    `preselected`, if given, seeds the group instead of picking our own
+    anchor — used to top up a group of randomly-chosen never-ranked items
+    (see `_never_ranked_items`) with the most informative *known* items to
+    pair them against, rather than discarding that random pick and
+    starting over.
     """
     n = len(items)
 
-    # Anchor on the item with the most unknown relations overall — the
-    # single best starting point for a productive group.
-    def unknown_degree(a):
-        return sum(1 for b in items if b != a and (a, b) not in relations)
+    if preselected:
+        chosen = list(preselected)
+        chosen_set = set(chosen)
+    else:
+        # Anchor on the item with the most unknown relations overall — the
+        # single best starting point for a productive group.
+        def unknown_degree(a):
+            return sum(1 for b in items if b != a and (a, b) not in relations)
 
-    start = max(items, key=unknown_degree)
-    chosen = [start]
-    chosen_set = {start}
+        start = max(items, key=unknown_degree)
+        chosen = [start]
+        chosen_set = {start}
 
     while len(chosen) < size and len(chosen) < n:
         best_item = None
@@ -194,6 +205,22 @@ def _pick_informative_group(items, relations, size):
         chosen_set.add(best_item)
 
     return chosen
+
+
+def _never_ranked_items(items, sorted_subsections):
+    """
+    Items that have never appeared in *any* previously sorted subsection at
+    all — not just ones with no known relation to other songs currently in
+    `items`. A song can have "unknown" relations to everything in the
+    current playlist while still being one the user has ranked plenty
+    before (just never against these particular songs); this is the
+    narrower set of songs that have literally never been put in front of
+    the user for ranking, in any playlist, ever.
+    """
+    ever_ranked: set = set()
+    for subsection in sorted_subsections or []:
+        ever_ranked.update(subsection)
+    return [item for item in items if item not in ever_ranked]
 
 
 def _prepare(sorted_subsections, unsorted_dictionary) -> tuple[list, dict]:
@@ -224,6 +251,17 @@ def nextSubsectionToSort(sorted_subsections, unsorted_dictionary, subsection_siz
         `unsorted_dictionary` is already fully sortable from known relations
         (check with `is_fully_determined` / `finalize_order` to get the
         actual resulting order in that case).
+
+    Prioritizes surfacing songs that have never been ranked at all: while
+    any exist, a random sample of them is favored over the purely
+    informative "in-between" grouping (which tends to keep recombining
+    songs already touched, since those are what carry the known relations
+    it reasons about). Once every song has been seen at least once, this
+    reduces to the "in-between" grouping alone. If a subsection would
+    otherwise come up short of never-ranked songs, the remaining slots are
+    filled in from the known items using the same informative-group logic,
+    so the random pick still gets paired against something useful rather
+    than sitting in an undersized group.
     """
     items, relations = _prepare(sorted_subsections, unsorted_dictionary)
     n = len(items)
@@ -239,6 +277,13 @@ def nextSubsectionToSort(sorted_subsections, unsorted_dictionary, subsection_siz
     # nothing left to ask the user — the order can be finalized outright.
     if _all_pairs_known(items, relations):
         return []
+
+    unseen = _never_ranked_items(items, sorted_subsections)
+    if unseen:
+        chosen = random.sample(unseen, min(subsection_size, len(unseen)))
+        if len(chosen) < subsection_size:
+            chosen = _pick_informative_group(items, relations, subsection_size, preselected=chosen)
+        return chosen
 
     return _pick_informative_group(items, relations, subsection_size)
 

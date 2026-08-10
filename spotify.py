@@ -10,7 +10,9 @@ from typing import Any, Callable
 FetchFn = Callable[[str], "dict[str, Any] | None"]
 
 
-def get_playlist_as_ranking_dict(playlist_id: str, fetch: FetchFn) -> dict[str, dict[str, Any]]:
+def get_playlist_as_ranking_dict(
+    playlist_id: str, fetch: FetchFn
+) -> tuple[dict[str, dict[str, Any]], bool]:
     """
     Fetch every track in a Spotify playlist and return it as an unsorted
     dictionary keyed by Spotify track ID.
@@ -25,11 +27,15 @@ def get_playlist_as_ranking_dict(playlist_id: str, fetch: FetchFn) -> dict[str, 
         fetch: callable(path) -> parsed JSON dict or None. See `FetchFn`.
 
     Returns:
-        Dict of track_id -> {"title", "artist", "album", "uri"}.
-        Local files and any track missing an ID are skipped, since they
-        don't have a stable identity to key on.
+        (Dict of track_id -> {"title", "artist", "album", "uri"}, whether
+        every page of the playlist was fetched successfully). Local files
+        and any track missing an ID are skipped, since they don't have a
+        stable identity to key on. The success flag lets callers avoid
+        treating a dict that's merely incomplete (a page failed partway
+        through) as if it were the whole playlist.
     """
     playlist_dict: dict[str, dict[str, Any]] = {}
+    fetch_succeeded = True
     # Spotify's March 2026 API migration removed GET/POST/PUT/DELETE on
     # /playlists/{id}/tracks entirely (it now 403s) in favor of
     # /playlists/{id}/items, with each paging entry's "track" field renamed
@@ -43,6 +49,7 @@ def get_playlist_as_ranking_dict(playlist_id: str, fetch: FetchFn) -> dict[str, 
     while path:
         payload = fetch(path)
         if not payload:
+            fetch_succeeded = False
             break
 
         for entry in payload.get("items", []):
@@ -74,4 +81,4 @@ def get_playlist_as_ranking_dict(playlist_id: str, fetch: FetchFn) -> dict[str, 
         idx = next_url.find(marker)
         path = next_url[idx + len(marker):] if idx != -1 else None
 
-    return playlist_dict
+    return playlist_dict, fetch_succeeded

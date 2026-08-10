@@ -4,7 +4,7 @@ Ranking songs inside a playlist by ranking small subsections at a time, until a 
 
 How it works
 
-nextSubsectionToSort (in algo.py) Given a list of already-sorted subsections and a larger unsorted collection, returns the next subsection worth asking the user to sort — the one that will teach the algorithm the most about the full ordering. It's biased toward subsections with mostly-unknown pairwise relationships, with a light preference for including one or two already-known items as anchors.
+nextSubsectionToSort (in algo.py) Given a list of already-sorted subsections and a larger unsorted collection, returns the next subsection worth asking the user to sort. While any songs in the collection have never appeared in *any* previously sorted subsection at all, it favors a random sample of those over its usual "in-between" pick — otherwise the in-between logic, which reasons from known relations, tends to keep recombining songs that have already been touched. Once every song has been seen at least once (or if there aren't enough never-ranked songs left to fill the subsection on their own), it falls back to — or tops the group up with — the informative "in-between" pick: the group that maximizes still-unknown pairwise relationships, so a newly-surfaced song still gets paired against something useful rather than sitting in an undersized group.
 
 Completion detection (is_fully_determined / finalize_order) Pairwise relationships are transitively closed: if A was ranked before B in one subsection, and B before C in a completely different one (even from a different playlist), then A before C is already known, without ever comparing A and C directly. Once every pair in a playlist is comparable this way, finalize_order returns the full resulting order and there's nothing left to ask. This means a playlist can occasionally come up already fully ranked the first time you open it, purely from subsections built while ranking other playlists.
 
@@ -34,6 +34,10 @@ The Rankings link in the nav (present on every page) shows every subsection you'
 Data & persistence
 
 Song metadata and the list of ranked subsections live in ranker_data.json, created next to app.py on first use (override the path with the RANKER_DATA_FILE environment variable). This is what survives restarts and reloads — nothing here depends on browser storage. The "Reset local state" button on the home page only clears the Spotify connection/session, not your saved rankings.
+
+Spotify API caching
+
+The playlist list and each playlist's tracks are cached in memory for 60 seconds by default (override with the SPOTIFY_CACHE_TTL_SECONDS environment variable), so normal navigation and page reloads don't re-hit the Spotify API and risk rate limiting (HTTP 429). A failed fetch is never cached, so a transient error just gets retried on the next load rather than being "stuck" for the TTL. Both the home page and the ranking page have a "refresh from Spotify" link (?refresh=1) to bypass the cache on demand — e.g. right after you've edited the playlist in Spotify itself. This cache is purely for Spotify API responses and has no effect on saved rankings, which are only ever read from/written to ranker_data.json.
 
 Importing as a playlist
 

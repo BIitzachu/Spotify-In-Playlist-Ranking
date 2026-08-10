@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +45,48 @@ STATE: dict[str, Any] = {
     "error": "",
     "subsection_size": DEFAULT_SUBSECTION_SIZE,
 }
+
+# Populated by spotify_get() on failure with the real underlying reason,
+# since "returned None" by itself is ambiguous (see spotify_get's docstring).
+LAST_SPOTIFY_ERROR: dict[str, Any] = {}
+
+# ---------------------------------------------------------------------------
+# Small TTL cache for read-only Spotify API responses (the playlist list and
+# each playlist's tracks). This is purely to avoid re-hitting the API on
+# every page load/reload and tripping Spotify's rate limiting — it has
+# nothing to do with ranking data, which always lives in ranker_data.json
+# via storage.py regardless of this cache's state.
+# ---------------------------------------------------------------------------
+CACHE_TTL_SECONDS = float(os.getenv("SPOTIFY_CACHE_TTL_SECONDS", "60"))
+_CACHE: dict[str, tuple[float, Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: str) -> Any | None:
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if not entry:
+            return None
+        expires_at, value = entry
+        if time.time() >= expires_at:
+            del _CACHE[key]
+            return None
+        return value
+
+
+def _cache_set(key: str, value: Any, ttl: float = CACHE_TTL_SECONDS) -> None:
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time() + ttl, value)
+
+
+def _cache_clear(prefix: str | None = None) -> None:
+    """Drop one cache entry's prefix, or everything when prefix is None."""
+    with _CACHE_LOCK:
+        if prefix is None:
+            _CACHE.clear()
+        else:
+            for key in [k for k in _CACHE if k.startswith(prefix)]:
+                del _CACHE[key]
 
 
 def set_flash(message: str = "", error: str = "") -> None:
@@ -151,9 +194,39 @@ def get_access_token() -> str | None:
     return token.get("access_token")
 
 
+def _retry_after_delay(exc: urllib.error.HTTPError, cap: float = 30.0) -> float:
+    """
+    Parse the Retry-After header Spotify sends on a 429, per their own
+    guidance to wait exactly as long as they say instead of guessing.
+    Falls back to a modest default when the header's missing/unparseable,
+    and always caps it — mainly so a request thread can't be told by a
+    (possibly misbehaving) response to sleep for an absurd amount of time.
+    """
+    header = exc.headers.get("Retry-After") if exc.headers else None
+    try:
+        delay = float(header) if header is not None else 1.0
+    except (TypeError, ValueError):
+        delay = 1.0
+    return max(0.0, min(delay, cap))
+
+
 def spotify_get(path: str) -> dict[str, Any] | None:
+    """
+    GET from the Spotify API. Returns the parsed JSON, or None on any
+    failure — but unlike before, the *real* reason for a None is now kept
+    in LAST_SPOTIFY_ERROR (see /debug/playlists) instead of being silently
+    discarded, since "returned None" alone could mean a dozen different
+    things (no token, expired token, refresh failure, network error, a
+    non-401 HTTP error, a malformed response, ...).
+    """
+    LAST_SPOTIFY_ERROR.clear()
+
     access_token = get_access_token()
     if not access_token:
+        LAST_SPOTIFY_ERROR["reason"] = (
+            "No valid access token — either never connected, or the stored "
+            "refresh token is missing/invalid and refresh_access_token() failed."
+        )
         return None
 
     url = f"{SPOTIFY_API_BASE_URL}{path}"
@@ -165,14 +238,45 @@ def spotify_get(path: str) -> dict[str, Any] | None:
         if exc.code == 401 and refresh_access_token():
             refreshed = get_access_token()
             if not refreshed:
+                LAST_SPOTIFY_ERROR["reason"] = "Got HTTP 401, and refresh_access_token() failed afterward."
                 return None
             retry = urllib.request.Request(url, headers=auth_headers(refreshed), method="GET")
             try:
                 return read_json(retry)
-            except Exception:
+            except urllib.error.HTTPError as exc2:
+                body_text = exc2.read().decode("utf-8", errors="replace")
+                LAST_SPOTIFY_ERROR["reason"] = f"HTTP {exc2.code} after refresh+retry: {body_text[:400]}"
                 return None
+            except Exception as exc2:
+                LAST_SPOTIFY_ERROR["reason"] = f"{type(exc2).__name__} after refresh+retry: {exc2}"
+                return None
+        if exc.code == 429:
+            # Wait exactly as long as Spotify's Retry-After header says, then
+            # retry once — per Spotify's own recommended approach, rather
+            # than surfacing a rate-limit error the user just has to retry
+            # themselves a moment later.
+            delay = _retry_after_delay(exc)
+            time.sleep(delay)
+            try:
+                return read_json(request)
+            except urllib.error.HTTPError as exc2:
+                body_text = exc2.read().decode("utf-8", errors="replace")
+                LAST_SPOTIFY_ERROR["reason"] = (
+                    f"Still rate-limited (HTTP 429) after waiting {delay:.0f}s "
+                    f"per Retry-After and retrying once: {body_text[:400]}"
+                )
+                return None
+            except Exception as exc2:
+                LAST_SPOTIFY_ERROR["reason"] = f"{type(exc2).__name__} after 429 retry: {exc2}"
+                return None
+        body_text = exc.read().decode("utf-8", errors="replace")
+        LAST_SPOTIFY_ERROR["reason"] = f"HTTP {exc.code}: {body_text[:400]}"
         return None
-    except Exception:
+    except urllib.error.URLError as exc:
+        LAST_SPOTIFY_ERROR["reason"] = f"Network error reaching Spotify: {exc.reason}"
+        return None
+    except Exception as exc:
+        LAST_SPOTIFY_ERROR["reason"] = f"{type(exc).__name__}: {exc}"
         return None
 
 
@@ -211,6 +315,14 @@ def spotify_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
                 except urllib.error.HTTPError as exc2:
                     body_text = exc2.read().decode("utf-8", errors="replace")
                     raise SpotifyApiError(exc2.code, body_text) from exc2
+        if exc.code == 429:
+            delay = _retry_after_delay(exc)
+            time.sleep(delay)
+            try:
+                return _attempt(access_token)
+            except urllib.error.HTTPError as exc2:
+                body_text = exc2.read().decode("utf-8", errors="replace")
+                raise SpotifyApiError(exc2.code, body_text) from exc2
         body_text = exc.read().decode("utf-8", errors="replace")
         raise SpotifyApiError(exc.code, body_text) from exc
 
@@ -247,6 +359,15 @@ def spotify_put(path: str, body: dict[str, Any] | None = None) -> None:
                 except urllib.error.HTTPError as exc2:
                     body_text = exc2.read().decode("utf-8", errors="replace")
                     raise SpotifyApiError(exc2.code, body_text) from exc2
+        if exc.code == 429:
+            delay = _retry_after_delay(exc)
+            time.sleep(delay)
+            try:
+                _attempt(access_token)
+                return
+            except urllib.error.HTTPError as exc2:
+                body_text = exc2.read().decode("utf-8", errors="replace")
+                raise SpotifyApiError(exc2.code, body_text) from exc2
         body_text = exc.read().decode("utf-8", errors="replace")
         raise SpotifyApiError(exc.code, body_text) from exc
 
@@ -307,13 +428,21 @@ def play_track_in_context(track_uri: str, context_uri: str | None) -> tuple[bool
     return ok, reason
 
 
-def fetch_all_playlists() -> list[dict[str, Any]]:
+def fetch_all_playlists(force_refresh: bool = False) -> list[dict[str, Any]]:
+    cache_key = "playlists"
+    if not force_refresh:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
     playlists: list[dict[str, Any]] = []
     path = "/me/playlists?limit=50"
+    fetch_succeeded = True
 
     while path:
         payload = spotify_get(path)
         if not payload:
+            fetch_succeeded = False
             break
         playlists.extend(payload.get("items", []))
 
@@ -322,6 +451,8 @@ def fetch_all_playlists() -> list[dict[str, Any]]:
             break
         path = next_url.replace(SPOTIFY_API_BASE_URL, "")
 
+    if fetch_succeeded:
+        _cache_set(cache_key, playlists)
     return playlists
 
 
@@ -336,21 +467,38 @@ def selected_playlist(playlists: list[dict[str, Any]]) -> dict[str, Any] | None:
     return STATE.get("selected_playlist")
 
 
-def fetch_current_playlist_tracks() -> dict[str, dict[str, Any]]:
+def fetch_current_playlist_tracks(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
     """
-    Tracks of the currently selected playlist, keyed by track ID. Freshly
-    fetched from Spotify every call (so playlist edits show up), and any
-    new song metadata is cached into local storage for reuse — e.g. so the
-    rankings gallery can show titles without needing a live playlist to
-    reference.
+    Tracks of the currently selected playlist, keyed by track ID.
+
+    Once a playlist's been loaded, its track ID list is persisted to
+    ranker_data.json (via storage.save_playlist_tracks) — not just cached
+    in memory — so ranking it back up can continue across app restarts
+    without ever calling Spotify again for its contents. Pass
+    force_refresh=True (or use the "Refresh from Spotify" link) to re-fetch
+    and overwrite that, e.g. after adding/removing songs in Spotify itself.
     """
     selected = STATE.get("selected_playlist") or {}
     playlist_id = selected.get("id")
     if not playlist_id:
         return {}
 
-    tracks = spotify.get_playlist_as_ranking_dict(playlist_id, spotify_get)
+    if not force_refresh:
+        stored = storage.get_playlist_tracks(playlist_id)
+        if stored is not None:
+            tracks = storage.get_songs(stored["track_ids"])
+            if len(tracks) == len(stored["track_ids"]):
+                return tracks
+            # Stored membership references a song whose metadata is missing
+            # (shouldn't normally happen — upsert_songs and
+            # save_playlist_tracks are always written together). Fall
+            # through to a live refetch rather than silently ranking a
+            # playlist short a few songs.
+
+    tracks, fetch_succeeded = spotify.get_playlist_as_ranking_dict(playlist_id, spotify_get)
     storage.upsert_songs(tracks)
+    if fetch_succeeded:
+        storage.save_playlist_tracks(playlist_id, list(tracks.keys()), name=selected.get("name"))
     return tracks
 
 
@@ -499,12 +647,12 @@ def render_page(title: str, active: str, body: str, wide: bool = False) -> str:
     """
 
 
-def render_homepage() -> str:
+def render_homepage(force_refresh: bool = False) -> str:
     playlists: list[dict[str, Any]] = []
     selected = None
 
     if STATE.get("token"):
-        playlists = fetch_all_playlists()
+        playlists = fetch_all_playlists(force_refresh=force_refresh)
         selected = selected_playlist(playlists)
         if selected and not STATE.get("selected_playlist"):
             STATE["selected_playlist"] = selected
@@ -586,6 +734,10 @@ def render_homepage() -> str:
           <div class="playlist-list">
             {''.join(playlist_list)}
           </div>
+          <p class="muted" style="margin-top: 8px;">
+            Playlist list is cached briefly to avoid hitting Spotify's rate limit —
+            <a href="/?refresh=1">refresh from Spotify</a> if you just changed something there.
+          </p>
         """
 
     debug_note = ""
@@ -794,7 +946,7 @@ def render_finished_page(selected: dict[str, Any], order: list[str], tracks: dic
     return render_page(f"{selected.get('name')} — finished", "rank", body)
 
 
-def render_rank_page() -> str:
+def render_rank_page(force_refresh: bool = False) -> str:
     selected = STATE.get("selected_playlist")
     message = f"<div class='alert ok'>{safe(STATE['message'])}</div>" if STATE.get("message") else ""
     error = f"<div class='alert error'>{safe(STATE['error'])}</div>" if STATE.get("error") else ""
@@ -808,7 +960,7 @@ def render_rank_page() -> str:
         """
         return render_page("Rank a playlist", "rank", body)
 
-    tracks = fetch_current_playlist_tracks()
+    tracks = fetch_current_playlist_tracks(force_refresh=force_refresh)
     set_flash()
 
     if not tracks:
@@ -850,9 +1002,25 @@ def render_rank_page() -> str:
           {cards_html}
         </div>
         <div class="actions" style="justify-content: flex-end;">
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <span class="muted">Next subsection size</span>
+            <input
+              type="number"
+              name="next_size"
+              min="2"
+              max="{len(tracks)}"
+              value="{size}"
+              style="width: 70px;"
+            >
+          </label>
           <button class="button primary" type="submit">Next →</button>
         </div>
       </form>
+      <p class="muted" style="margin-top: 10px;">
+        Playlist contents are stored locally after the first load, so ranking continues without
+        recontacting Spotify — <a href="/rank?refresh=1">refresh from Spotify</a> if you just
+        edited this playlist and want that reflected here.
+      </p>
       {DRAG_SCRIPT}
       {PLAY_SCRIPT}
     """
@@ -1030,6 +1198,7 @@ def exchange_code(code: str) -> bool:
     store_token(payload)
     STATE["code_verifier"] = ""
     STATE["oauth_state"] = ""
+    _cache_clear()
     set_flash(message="Spotify account connected.")
     return True
 
@@ -1064,6 +1233,7 @@ def reset_state() -> None:
             "subsection_size": DEFAULT_SUBSECTION_SIZE,
         }
     )
+    _cache_clear()
     set_flash(message="Local Spotify state cleared. Your saved rankings are untouched.")
 
 
@@ -1101,7 +1271,8 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
 
         if path == "/":
-            self.send_html(render_homepage())
+            force_refresh = query.get("refresh", [""])[0] == "1"
+            self.send_html(render_homepage(force_refresh=force_refresh))
             return
 
         if path == "/debug/playlists":
@@ -1114,11 +1285,10 @@ class Handler(BaseHTTPRequestHandler):
             if raw is None:
                 self.send_json(
                     {
-                        "error": (
-                            "spotify_get() returned None. This usually means the access "
-                            "token is missing/expired and refresh also failed, or the "
-                            "HTTP request itself errored out silently."
-                        )
+                        "error": "spotify_get() returned None.",
+                        "reason": LAST_SPOTIFY_ERROR.get(
+                            "reason", "No reason was captured — this shouldn't happen; please report it."
+                        ),
                     },
                     status=502,
                 )
@@ -1175,7 +1345,8 @@ class Handler(BaseHTTPRequestHandler):
             size_param = query.get("size", [""])[0]
             if size_param.isdigit() and int(size_param) > 0:
                 STATE["subsection_size"] = int(size_param)
-            self.send_html(render_rank_page())
+            force_refresh = query.get("refresh", [""])[0] == "1"
+            self.send_html(render_rank_page(force_refresh=force_refresh))
             return
 
         if path == "/subsections":
@@ -1239,6 +1410,10 @@ class Handler(BaseHTTPRequestHandler):
                 set_flash(error="That didn't look like a valid ranking — nothing was saved.")
                 self.redirect("/rank")
                 return
+
+            size_raw = form.get("next_size", "").strip()
+            if size_raw.isdigit() and int(size_raw) >= 2:
+                STATE["subsection_size"] = int(size_raw)
 
             selected = STATE.get("selected_playlist") or {}
             storage.add_subsection(order_ids, source_playlist_name=selected.get("name"))

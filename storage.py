@@ -19,19 +19,20 @@ DATA_FILE = os.getenv(
 
 _LOCK = threading.Lock()
 
-_EMPTY: dict[str, Any] = {"songs": {}, "subsections": []}
+_EMPTY: dict[str, Any] = {"songs": {}, "subsections": [], "playlists": {}}
 
 
 def _load() -> dict[str, Any]:
     if not os.path.exists(DATA_FILE):
-        return {"songs": {}, "subsections": []}
+        return {"songs": {}, "subsections": [], "playlists": {}}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return {"songs": {}, "subsections": []}
+        return {"songs": {}, "subsections": [], "playlists": {}}
     data.setdefault("songs", {})
     data.setdefault("subsections", [])
+    data.setdefault("playlists", {})
     return data
 
 
@@ -106,3 +107,26 @@ def update_subsection(subsection_id: str, track_ids: list[str]) -> dict[str, Any
                 _save(data)
                 return sub
     return None
+
+
+def get_playlist_tracks(playlist_id: str) -> dict[str, Any] | None:
+    """
+    The persisted {"track_ids": [...], "name": ..., "updated_at": ...}
+    record for a playlist, or None if it's never been fetched (or fetching
+    it was explicitly asked to be refreshed since). `track_ids` is in
+    playlist order. This is what lets a previously-loaded playlist be
+    ranked entirely offline — no repeat calls to Spotify for its contents.
+    """
+    with _LOCK:
+        data = _load()
+    return data["playlists"].get(playlist_id)
+
+
+def save_playlist_tracks(playlist_id: str, track_ids: list[str], name: str | None = None) -> dict[str, Any]:
+    """Persist a playlist's current track ID order after fetching it from Spotify."""
+    record = {"track_ids": list(track_ids), "name": name, "updated_at": time.time()}
+    with _LOCK:
+        data = _load()
+        data["playlists"][playlist_id] = record
+        _save(data)
+    return record
